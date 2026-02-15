@@ -15,6 +15,7 @@ vi.mock('../../../src/background/screenshotManager', () => ({
 
 vi.mock('../../../src/background/recoveryManager', () => ({
   saveSession: vi.fn().mockResolvedValue(undefined),
+  restoreSession: vi.fn().mockResolvedValue(null),
 }));
 
 import {
@@ -35,7 +36,10 @@ import {
   clearPreClickBuffer,
   getPreClickBuffer,
   getQueuedEvent,
+  ensureSession,
 } from '../../../src/background/captureManager';
+
+import { restoreSession } from '../../../src/background/recoveryManager';
 
 import type {
   SessionStatus,
@@ -863,6 +867,60 @@ describe('captureManager', () => {
       // Flush any deferred processing — nothing should happen since session is null
       await new Promise((r) => setTimeout(r, 50));
       expect(getSession()).toBeNull();
+    });
+  });
+
+  // ── ensureSession ──────────────────────────────────────────────────
+
+  describe('ensureSession', () => {
+    it('should return in-memory session when available (no storage call)', async () => {
+      const session = makeSession({ status: 'editing' });
+      setSession(session);
+
+      const result = await ensureSession();
+
+      expect(result).toBe(session);
+      expect(restoreSession).not.toHaveBeenCalled();
+    });
+
+    it('should restore from storage when currentSession is null', async () => {
+      const savedSession = makeSession({ id: 'session-restored', status: 'editing' });
+      vi.mocked(restoreSession).mockResolvedValueOnce(savedSession);
+      setSession(null);
+
+      const result = await ensureSession();
+
+      expect(restoreSession).toHaveBeenCalledOnce();
+      expect(result).toBe(savedSession);
+      // Should also set currentSession
+      expect(getSession()).toBe(savedSession);
+    });
+
+    it('should return null when storage is also empty', async () => {
+      vi.mocked(restoreSession).mockResolvedValueOnce(null);
+      setSession(null);
+
+      const result = await ensureSession();
+
+      expect(restoreSession).toHaveBeenCalledOnce();
+      expect(result).toBeNull();
+      expect(getSession()).toBeNull();
+    });
+
+    it('should not hit storage again after restore (subsequent calls use in-memory)', async () => {
+      const savedSession = makeSession({ id: 'session-restored', status: 'editing' });
+      vi.mocked(restoreSession).mockResolvedValueOnce(savedSession);
+      setSession(null);
+
+      // First call: restores from storage
+      await ensureSession();
+      expect(restoreSession).toHaveBeenCalledOnce();
+
+      // Second call: uses in-memory session
+      vi.mocked(restoreSession).mockClear();
+      const result = await ensureSession();
+      expect(restoreSession).not.toHaveBeenCalled();
+      expect(result).toBe(savedSession);
     });
   });
 });

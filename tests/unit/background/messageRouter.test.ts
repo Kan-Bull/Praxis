@@ -11,11 +11,12 @@ vi.mock('../../../src/background/recoveryManager', () => ({
   saveSession: vi.fn().mockResolvedValue(undefined),
   clearRecoveryData: vi.fn().mockResolvedValue(undefined),
   purgeExpiredSessions: vi.fn().mockResolvedValue(undefined),
+  restoreSession: vi.fn().mockResolvedValue(null),
 }));
 
 import { setSession, getSession, setToolbarPosition, getToolbarPosition, bufferPreClickScreenshot, getPreClickBufferPending } from '../../../src/background/captureManager';
 import { captureScreenshot, resizeScreenshotSW, createThumbnailSW } from '../../../src/background/screenshotManager';
-import { saveSession } from '../../../src/background/recoveryManager';
+import { saveSession, restoreSession } from '../../../src/background/recoveryManager';
 import type { CaptureSession } from '../../../src/shared/types';
 
 // Import to register the listener
@@ -70,104 +71,97 @@ function getMessageListener(): (
   return calls[calls.length - 1][0];
 }
 
+// Cache listeners at module level — clearAllMocks would wipe mock.calls
+const cachedMessageListener = getMessageListener();
+
+function getOnCommittedListener(): (details: { tabId: number; frameId: number; url: string }) => void {
+  const calls = (chrome.webNavigation.onCommitted.addListener as ReturnType<typeof vi.fn>).mock.calls;
+  return calls[calls.length - 1][0];
+}
+const cachedOnCommittedListener = getOnCommittedListener();
+
+/** Send a message through the router and return the response (async). */
+async function routeMessage(message: unknown): Promise<unknown> {
+  return new Promise<unknown>((resolve) => {
+    cachedMessageListener(message, {}, resolve);
+  });
+}
+
 describe('SW message router — editor messages', () => {
   beforeEach(() => {
+    // Reset specific mocks (not clearAllMocks — that wipes addListener.mock.calls)
+    vi.mocked(restoreSession).mockReset().mockResolvedValue(null);
+    vi.mocked(saveSession).mockReset().mockResolvedValue(undefined);
+    vi.mocked(captureScreenshot).mockReset().mockResolvedValue('data:image/png;base64,screenshot');
+    vi.mocked(resizeScreenshotSW).mockReset().mockResolvedValue('data:image/png;base64,resized');
+    vi.mocked(createThumbnailSW).mockReset().mockResolvedValue('data:image/jpeg;base64,thumb');
     setSession(null);
     setToolbarPosition(null);
   });
 
   describe('UPDATE_STEP_DESCRIPTION', () => {
-    it('updates description for existing step', () => {
+    it('updates description for existing step', async () => {
       setSession(makeSession());
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'UPDATE_STEP_DESCRIPTION', payload: { stepId: 'step-1', description: 'New desc' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       expect(getSession()!.steps[0].description).toBe('New desc');
     });
 
-    it('returns error for non-existent step', () => {
+    it('returns error for non-existent step', async () => {
       setSession(makeSession());
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'UPDATE_STEP_DESCRIPTION', payload: { stepId: 'no-such-step', description: 'x' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith(
+      expect(response).toEqual(
         expect.objectContaining({ status: 'error' }),
       );
     });
   });
 
   describe('UPDATE_STEP_ANNOTATIONS', () => {
-    it('updates annotations for existing step', () => {
+    it('updates annotations for existing step', async () => {
       setSession(makeSession());
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'UPDATE_STEP_ANNOTATIONS', payload: { stepId: 'step-1', annotations: '{"objects":[]}' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       expect(getSession()!.steps[0].annotations).toBe('{"objects":[]}');
     });
 
-    it('returns error for non-existent step', () => {
+    it('returns error for non-existent step', async () => {
       setSession(makeSession());
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'UPDATE_STEP_ANNOTATIONS', payload: { stepId: 'nope', annotations: '{}' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith(
+      expect(response).toEqual(
         expect.objectContaining({ status: 'error' }),
       );
     });
   });
 
   describe('SAVE_TOOLBAR_POSITION', () => {
-    it('stores toolbar position via captureManager', () => {
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+    it('stores toolbar position via captureManager', async () => {
+      const response = await routeMessage(
         { type: 'SAVE_TOOLBAR_POSITION', payload: { x: 150, y: 30 } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       expect(getToolbarPosition()).toEqual({ x: 150, y: 30 });
     });
 
-    it('overwrites previous position', () => {
+    it('overwrites previous position', async () => {
       setToolbarPosition({ x: 10, y: 20 });
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'SAVE_TOOLBAR_POSITION', payload: { x: 400, y: 60 } },
-        {},
-        sendResponse,
       );
 
+      expect(response).toEqual({ status: 'ok' });
       expect(getToolbarPosition()).toEqual({ x: 400, y: 60 });
     });
   });
@@ -175,97 +169,65 @@ describe('SW message router — editor messages', () => {
   describe('PRE_CLICK_BUFFER', () => {
     it('calls bufferPreClickScreenshot when capturing', async () => {
       setSession(makeSession({ status: 'capturing', tabId: 42 }));
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      const isAsync = listener(
+      const response = await routeMessage(
         { type: 'PRE_CLICK_BUFFER', payload: { timestamp: Date.now() } },
-        {},
-        sendResponse,
       );
 
-      expect(isAsync).toBe(true);
-
-      // Wait for the buffer capture to complete — the handler now waits for
-      // the pending promise before calling sendResponse
-      const pending = getPreClickBufferPending();
-      if (pending) await pending;
-      // Allow the .then() chain to resolve
-      await new Promise((r) => setTimeout(r, 0));
-
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
     });
 
-    it('does not buffer when not capturing', () => {
+    it('does not buffer when not capturing', async () => {
       setSession(makeSession({ status: 'editing', tabId: 42 }));
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
 
       vi.mocked(captureScreenshot).mockClear();
 
-      listener(
+      const response = await routeMessage(
         { type: 'PRE_CLICK_BUFFER', payload: { timestamp: Date.now() } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       expect(captureScreenshot).not.toHaveBeenCalled();
     });
 
-    it('does not buffer when no session exists', () => {
+    it('does not buffer when no session exists', async () => {
       setSession(null);
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
 
       vi.mocked(captureScreenshot).mockClear();
 
-      listener(
+      const response = await routeMessage(
         { type: 'PRE_CLICK_BUFFER', payload: { timestamp: Date.now() } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       expect(captureScreenshot).not.toHaveBeenCalled();
     });
   });
 
   describe('UPDATE_STEP_SCREENSHOT', () => {
-    it('updates screenshot for existing step', () => {
+    it('updates screenshot for existing step', async () => {
       setSession(makeSession());
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'UPDATE_STEP_SCREENSHOT', payload: { stepId: 'step-1', screenshotDataUrl: 'data:image/png;base64,cropped' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       expect(getSession()!.steps[0].screenshotDataUrl).toBe('data:image/png;base64,cropped');
     });
 
-    it('returns error for non-existent step', () => {
+    it('returns error for non-existent step', async () => {
       setSession(makeSession());
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'UPDATE_STEP_SCREENSHOT', payload: { stepId: 'no-such-step', screenshotDataUrl: 'data:image/png;base64,x' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith(
+      expect(response).toEqual(
         expect.objectContaining({ status: 'error' }),
       );
     });
   });
 
   describe('REORDER_STEPS', () => {
-    it('reorders steps according to provided stepIds', () => {
+    it('reorders steps according to provided stepIds', async () => {
       const session = makeSession();
       session.steps.push({
         id: 'step-2',
@@ -279,16 +241,11 @@ describe('SW message router — editor messages', () => {
       });
       setSession(session);
 
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'REORDER_STEPS', payload: { stepIds: ['step-2', 'step-1'] } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       const updated = getSession()!;
       expect(updated.steps[0].id).toBe('step-2');
       expect(updated.steps[1].id).toBe('step-1');
@@ -297,23 +254,18 @@ describe('SW message router — editor messages', () => {
       expect(updated.steps[1].stepNumber).toBe(2);
     });
 
-    it('returns error when no session exists', () => {
+    it('returns error when no session exists', async () => {
       setSession(null);
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'REORDER_STEPS', payload: { stepIds: ['step-1'] } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith(
+      expect(response).toEqual(
         expect.objectContaining({ status: 'error' }),
       );
     });
 
-    it('ignores unknown step IDs gracefully', () => {
+    it('ignores unknown step IDs gracefully', async () => {
       const session = makeSession();
       session.steps.push({
         id: 'step-2',
@@ -327,17 +279,12 @@ describe('SW message router — editor messages', () => {
       });
       setSession(session);
 
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
       // Include an unknown ID — it should be silently skipped
-      listener(
+      const response = await routeMessage(
         { type: 'REORDER_STEPS', payload: { stepIds: ['step-2', 'no-such-step', 'step-1'] } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       const updated = getSession()!;
       expect(updated.steps).toHaveLength(2);
       expect(updated.steps[0].id).toBe('step-2');
@@ -346,7 +293,7 @@ describe('SW message router — editor messages', () => {
   });
 
   describe('DELETE_STEP', () => {
-    it('removes step from session and renumbers remaining steps', () => {
+    it('removes step from session and renumbers remaining steps', async () => {
       const session = makeSession();
       session.steps.push({
         id: 'step-2',
@@ -360,50 +307,35 @@ describe('SW message router — editor messages', () => {
       });
       setSession(session);
 
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'DELETE_STEP', payload: { stepId: 'step-1' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      expect(response).toEqual({ status: 'ok' });
       const updated = getSession()!;
       expect(updated.steps).toHaveLength(1);
       expect(updated.steps[0].id).toBe('step-2');
       expect(updated.steps[0].stepNumber).toBe(1); // renumbered
     });
 
-    it('returns error for non-existent step', () => {
+    it('returns error for non-existent step', async () => {
       setSession(makeSession());
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'DELETE_STEP', payload: { stepId: 'no-such-step' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith(
+      expect(response).toEqual(
         expect.objectContaining({ status: 'error' }),
       );
     });
 
-    it('returns error when no session exists', () => {
+    it('returns error when no session exists', async () => {
       setSession(null);
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      const response = await routeMessage(
         { type: 'DELETE_STEP', payload: { stepId: 'step-1' } },
-        {},
-        sendResponse,
       );
 
-      expect(sendResponse).toHaveBeenCalledWith(
+      expect(response).toEqual(
         expect.objectContaining({ status: 'error' }),
       );
     });
@@ -418,19 +350,9 @@ describe('SW message router — editor messages', () => {
       });
       (chrome.tabs.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 2 });
 
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      const isAsync = listener(
+      const response = await routeMessage(
         { type: 'TAKE_SCREENSHOT', payload: { tabId: 1 } },
-        {},
-        sendResponse,
       );
-
-      expect(isAsync).toBe(true);
-
-      // Wait for async handler
-      await new Promise((r) => setTimeout(r, 50));
 
       expect(captureScreenshot).toHaveBeenCalledWith(1);
       expect(resizeScreenshotSW).toHaveBeenCalled();
@@ -448,7 +370,7 @@ describe('SW message router — editor messages', () => {
       expect(session!.steps[0].description).toBe('Example Page');
       expect(session!.title).toBe('Example Page');
 
-      expect(sendResponse).toHaveBeenCalledWith(
+      expect(response).toEqual(
         expect.objectContaining({ status: 'ok' }),
       );
     });
@@ -460,16 +382,9 @@ describe('SW message router — editor messages', () => {
       });
       (chrome.tabs.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 3 });
 
-      const listener = getMessageListener();
-      const sendResponse = vi.fn();
-
-      listener(
+      await routeMessage(
         { type: 'TAKE_SCREENSHOT', payload: { tabId: 2 } },
-        {},
-        sendResponse,
       );
-
-      await new Promise((r) => setTimeout(r, 50));
 
       const session = getSession();
       expect(session!.title).toBe('Screenshot');
@@ -485,9 +400,7 @@ describe('SW message router — editor messages', () => {
       setSession(makeSession({ status: 'capturing', tabId: 42 }));
       vi.mocked(chrome.scripting.executeScript).mockClear();
 
-      // Get the onCommitted listener
-      const calls = (chrome.webNavigation.onCommitted.addListener as ReturnType<typeof vi.fn>).mock.calls;
-      const onCommittedListener = calls[calls.length - 1][0];
+      const onCommittedListener = cachedOnCommittedListener;
 
       // Simulate hard navigation on the captured tab
       onCommittedListener({
@@ -507,8 +420,7 @@ describe('SW message router — editor messages', () => {
       setSession(makeSession({ status: 'capturing', tabId: 42 }));
       vi.mocked(chrome.scripting.executeScript).mockClear();
 
-      const calls = (chrome.webNavigation.onCommitted.addListener as ReturnType<typeof vi.fn>).mock.calls;
-      const onCommittedListener = calls[calls.length - 1][0];
+      const onCommittedListener = cachedOnCommittedListener;
 
       // Simulate navigation in an iframe (frameId !== 0)
       onCommittedListener({
@@ -524,8 +436,7 @@ describe('SW message router — editor messages', () => {
       setSession(makeSession({ status: 'capturing', tabId: 42 }));
       vi.mocked(chrome.scripting.executeScript).mockClear();
 
-      const calls = (chrome.webNavigation.onCommitted.addListener as ReturnType<typeof vi.fn>).mock.calls;
-      const onCommittedListener = calls[calls.length - 1][0];
+      const onCommittedListener = cachedOnCommittedListener;
 
       // Simulate navigation on a different tab
       onCommittedListener({
@@ -541,8 +452,7 @@ describe('SW message router — editor messages', () => {
       setSession(makeSession({ status: 'editing', tabId: 42 }));
       vi.mocked(chrome.scripting.executeScript).mockClear();
 
-      const calls = (chrome.webNavigation.onCommitted.addListener as ReturnType<typeof vi.fn>).mock.calls;
-      const onCommittedListener = calls[calls.length - 1][0];
+      const onCommittedListener = cachedOnCommittedListener;
 
       onCommittedListener({
         tabId: 42,
@@ -573,8 +483,7 @@ describe('SW message router — editor messages', () => {
       setToolbarPosition({ x: 200, y: 40 });
       vi.mocked(chrome.tabs.sendMessage).mockClear();
 
-      const calls = (chrome.webNavigation.onCommitted.addListener as ReturnType<typeof vi.fn>).mock.calls;
-      const onCommittedListener = calls[calls.length - 1][0];
+      const onCommittedListener = cachedOnCommittedListener;
 
       onCommittedListener({
         tabId: 42,
@@ -596,6 +505,106 @@ describe('SW message router — editor messages', () => {
           },
         },
       );
+    });
+  });
+
+  // ── Session Restoration After SW Restart ────────────────────────────
+
+  describe('session restoration after SW restart', () => {
+    const restoredStep = {
+      id: 'step-1',
+      stepNumber: 1,
+      description: 'Clicked button',
+      screenshotDataUrl: 'data:image/png;base64,restored-screenshot',
+      thumbnailDataUrl: 'data:image/jpeg;base64,restored-thumb',
+      element: {
+        tagName: 'BUTTON',
+        boundingRect: { x: 0, y: 0, width: 100, height: 40, top: 0, right: 100, bottom: 40, left: 0 },
+        isInIframe: false,
+      },
+      interaction: {
+        type: 'click' as const,
+        timestamp: Date.now(),
+        url: 'https://example.com',
+        element: {
+          tagName: 'BUTTON',
+          boundingRect: { x: 0, y: 0, width: 100, height: 40, top: 0, right: 100, bottom: 40, left: 0 },
+          isInIframe: false,
+        },
+      },
+      timestamp: Date.now(),
+      url: 'https://example.com',
+    };
+
+    it('restores session for GET_SESSION_DATA when currentSession is null', async () => {
+      const savedSession = makeSession({
+        id: 'session-restored',
+        status: 'editing',
+        steps: [restoredStep],
+      });
+      vi.mocked(restoreSession).mockResolvedValueOnce(savedSession);
+
+      // currentSession is null (simulating SW restart)
+      setSession(null);
+
+      const response = await routeMessage({ type: 'GET_SESSION_DATA', payload: {} }) as {
+        status: string;
+        session: CaptureSession | null;
+      };
+
+      expect(restoreSession).toHaveBeenCalled();
+      expect(response.status).toBe('ok');
+      expect(response.session).not.toBeNull();
+      expect(response.session!.id).toBe('session-restored');
+    });
+
+    it('restores session for GET_STEP_SCREENSHOT when currentSession is null', async () => {
+      const savedSession = makeSession({
+        status: 'editing',
+        steps: [restoredStep],
+      });
+      vi.mocked(restoreSession).mockResolvedValueOnce(savedSession);
+      setSession(null);
+
+      const response = await routeMessage({
+        type: 'GET_STEP_SCREENSHOT',
+        payload: { stepId: 'step-1' },
+      });
+
+      expect(response).toEqual({
+        status: 'ok',
+        screenshotDataUrl: 'data:image/png;base64,restored-screenshot',
+        thumbnailDataUrl: 'data:image/jpeg;base64,restored-thumb',
+      });
+    });
+
+    it('restores session for UPDATE_STEP_DESCRIPTION when currentSession is null', async () => {
+      const savedSession = makeSession({ status: 'editing', steps: [restoredStep] });
+      vi.mocked(restoreSession).mockResolvedValueOnce(savedSession);
+      setSession(null);
+
+      const response = await routeMessage({
+        type: 'UPDATE_STEP_DESCRIPTION',
+        payload: { stepId: 'step-1', description: 'Updated after restart' },
+      });
+
+      expect(response).toEqual({ status: 'ok' });
+      expect(getSession()!.steps[0].description).toBe('Updated after restart');
+    });
+
+    it('only calls restoreSession once (subsequent messages use in-memory)', async () => {
+      const savedSession = makeSession({ status: 'editing', steps: [restoredStep] });
+      vi.mocked(restoreSession).mockResolvedValueOnce(savedSession);
+      setSession(null);
+
+      // First message triggers restore
+      await routeMessage({ type: 'GET_SESSION_DATA', payload: {} });
+      expect(restoreSession).toHaveBeenCalledTimes(1);
+
+      // Second message uses in-memory session (restoreSession not called again)
+      vi.mocked(restoreSession).mockClear();
+      await routeMessage({ type: 'GET_SESSION_DATA', payload: {} });
+      expect(restoreSession).not.toHaveBeenCalled();
     });
   });
 });

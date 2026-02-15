@@ -13,6 +13,7 @@ import {
   setToolbarPosition,
   bufferPreClickScreenshot,
   getPreClickBufferPending,
+  ensureSession,
 } from './captureManager';
 import {
   captureScreenshot,
@@ -28,71 +29,67 @@ import {
 // ── Message Router ──────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener(
-  (message: ExtensionMessage, sender, sendResponse) => {
-    const msg = message as ExtensionMessage;
+  (message: ExtensionMessage, _sender, sendResponse) => {
+    handleMessage(message, sendResponse);
+    return true; // All handlers are async (ensureSession awaits storage)
+  },
+);
+
+async function handleMessage(
+  msg: ExtensionMessage,
+  sendResponse: (response?: unknown) => void,
+): Promise<void> {
+  try {
+    // Lazy restore: if the SW restarted and currentSession was lost,
+    // rehydrate from chrome.storage.local before any handler runs.
+    await ensureSession();
 
     switch (msg.type) {
-      case 'START_CAPTURE':
-        handleStartCapture(msg.payload.tabId)
-          .then((result) => sendResponse(result))
-          .catch((err) => {
-            logger.error('START_CAPTURE failed:', err);
-            sendResponse({ status: 'error', error: String(err) });
-          });
-        return true; // Async response
+      case 'START_CAPTURE': {
+        const result = await handleStartCapture(msg.payload.tabId);
+        sendResponse(result);
+        break;
+      }
 
-      case 'TAKE_SCREENSHOT':
-        handleTakeScreenshot(msg.payload.tabId)
-          .then((result) => sendResponse(result))
-          .catch((err) => {
-            logger.error('TAKE_SCREENSHOT failed:', err);
-            sendResponse({ status: 'error', error: String(err) });
-          });
-        return true;
+      case 'TAKE_SCREENSHOT': {
+        const result = await handleTakeScreenshot(msg.payload.tabId);
+        sendResponse(result);
+        break;
+      }
 
-      case 'STOP_CAPTURE':
-        handleStopCapture()
-          .then((result) => sendResponse(result))
-          .catch((err) => {
-            logger.error('STOP_CAPTURE failed:', err);
-            sendResponse({ status: 'error', error: String(err) });
-          });
-        return true;
+      case 'STOP_CAPTURE': {
+        const result = await handleStopCapture();
+        sendResponse(result);
+        break;
+      }
 
       case 'CANCEL_CAPTURE':
         handleCancelCapture();
         sendResponse({ status: 'ok' });
-        return false;
+        break;
 
-      case 'INTERACTION_EVENT':
-        // Fire-and-forget: process the event, save session afterward
-        handleInteractionEvent(msg.payload.event)
-          .then((step) => {
-            if (step) {
-              const session = getSession();
-              if (session) {
-                // Fire-and-forget save — don't block the response
-                saveSession(session).catch((err) =>
-                  logger.error('Auto-save failed:', err),
-                );
-              }
-            }
-            sendResponse({ status: 'ok', stepId: step?.id ?? null });
-          })
-          .catch((err) => {
-            logger.error('INTERACTION_EVENT failed:', err);
-            sendResponse({ status: 'error', error: String(err) });
-          });
-        return true;
+      case 'INTERACTION_EVENT': {
+        const step = await handleInteractionEvent(msg.payload.event);
+        if (step) {
+          const session = getSession();
+          if (session) {
+            saveSession(session).catch((err) =>
+              logger.error('Auto-save failed:', err),
+            );
+          }
+        }
+        sendResponse({ status: 'ok', stepId: step?.id ?? null });
+        break;
+      }
 
       case 'DOM_SETTLED':
         resolveDomSettle();
         sendResponse({ status: 'ok' });
-        return false;
+        break;
 
       case 'HEARTBEAT':
         sendResponse({ status: 'ok' });
-        return false;
+        break;
 
       case 'GET_SESSION_DATA': {
         const session = getSession();
@@ -109,7 +106,7 @@ chrome.runtime.onMessage.addListener(
           };
           sendResponse({ status: 'ok', session: metadata });
         }
-        return false;
+        break;
       }
 
       case 'GET_STEP_SCREENSHOT': {
@@ -120,26 +117,18 @@ chrome.runtime.onMessage.addListener(
           screenshotDataUrl: step?.screenshotDataUrl ?? null,
           thumbnailDataUrl: step?.thumbnailDataUrl ?? null,
         });
-        return false;
+        break;
       }
 
       case 'PRE_CLICK_BUFFER': {
         const session = getSession();
         if (session?.status === 'capturing') {
           bufferPreClickScreenshot(session.tabId);
-          // Wait for the capture to complete before responding — the content
-          // script holds a screenshot lock that prevents SHOW_TOOLBAR from
-          // re-showing the toolbar until this response arrives.
           const pending = getPreClickBufferPending();
-          if (pending) {
-            pending.then(() => sendResponse({ status: 'ok' }));
-          } else {
-            sendResponse({ status: 'ok' });
-          }
-        } else {
-          sendResponse({ status: 'ok' });
+          if (pending) await pending;
         }
-        return true; // async response
+        sendResponse({ status: 'ok' });
+        break;
       }
 
       case 'UPDATE_STEP_DESCRIPTION': {
@@ -147,7 +136,7 @@ chrome.runtime.onMessage.addListener(
         const step = session?.steps.find((s) => s.id === msg.payload.stepId);
         if (!step) {
           sendResponse({ status: 'error', error: 'Step not found' });
-          return false;
+          break;
         }
         step.description = msg.payload.description;
         if (session) {
@@ -157,7 +146,7 @@ chrome.runtime.onMessage.addListener(
           );
         }
         sendResponse({ status: 'ok' });
-        return false;
+        break;
       }
 
       case 'UPDATE_STEP_ANNOTATIONS': {
@@ -165,7 +154,7 @@ chrome.runtime.onMessage.addListener(
         const step = session?.steps.find((s) => s.id === msg.payload.stepId);
         if (!step) {
           sendResponse({ status: 'error', error: 'Step not found' });
-          return false;
+          break;
         }
         step.annotations = msg.payload.annotations;
         if (session) {
@@ -175,7 +164,7 @@ chrome.runtime.onMessage.addListener(
           );
         }
         sendResponse({ status: 'ok' });
-        return false;
+        break;
       }
 
       case 'UPDATE_STEP_SCREENSHOT': {
@@ -183,7 +172,7 @@ chrome.runtime.onMessage.addListener(
         const step = session?.steps.find((s) => s.id === msg.payload.stepId);
         if (!step) {
           sendResponse({ status: 'error', error: 'Step not found' });
-          return false;
+          break;
         }
         step.screenshotDataUrl = msg.payload.screenshotDataUrl;
         if (session) {
@@ -193,14 +182,14 @@ chrome.runtime.onMessage.addListener(
           );
         }
         sendResponse({ status: 'ok' });
-        return false;
+        break;
       }
 
       case 'REORDER_STEPS': {
         const session = getSession();
         if (!session) {
           sendResponse({ status: 'error', error: 'No session' });
-          return false;
+          break;
         }
         const { stepIds } = msg.payload;
         const stepMap = new Map(session.steps.map((s) => [s.id, s]));
@@ -216,19 +205,19 @@ chrome.runtime.onMessage.addListener(
           logger.error('Save after reorder failed:', err),
         );
         sendResponse({ status: 'ok' });
-        return false;
+        break;
       }
 
       case 'DELETE_STEP': {
         const session = getSession();
         if (!session) {
           sendResponse({ status: 'error', error: 'No session' });
-          return false;
+          break;
         }
         const idx = session.steps.findIndex((s) => s.id === msg.payload.stepId);
         if (idx === -1) {
           sendResponse({ status: 'error', error: 'Step not found' });
-          return false;
+          break;
         }
         session.steps.splice(idx, 1);
         // Renumber remaining steps
@@ -238,38 +227,37 @@ chrome.runtime.onMessage.addListener(
           logger.error('Save after step deletion failed:', err),
         );
         sendResponse({ status: 'ok' });
-        return false;
+        break;
       }
 
       case 'EXPORT_COMPLETE':
-        clearRecoveryData()
-          .then(() => sendResponse({ status: 'ok' }))
-          .catch((err) => {
-            logger.error('EXPORT_COMPLETE clear failed:', err);
-            sendResponse({ status: 'error', error: String(err) });
-          });
-        return true;
+        await clearRecoveryData();
+        sendResponse({ status: 'ok' });
+        break;
 
       case 'SAVE_TOOLBAR_POSITION':
         setToolbarPosition(msg.payload);
         sendResponse({ status: 'ok' });
-        return false;
+        break;
 
       case 'PAUSE_CAPTURE':
         sendResponse({ status: 'not_implemented' });
-        return false;
+        break;
 
       case 'RESUME_CAPTURE':
         sendResponse({ status: 'not_implemented' });
-        return false;
+        break;
 
       default:
         logger.warn('Unknown message type:', (msg as { type: string }).type);
         sendResponse({ status: 'unknown_message' });
-        return false;
+        break;
     }
-  },
-);
+  } catch (err) {
+    logger.error(`Message handler failed for ${msg.type}:`, err);
+    sendResponse({ status: 'error', error: String(err) });
+  }
+}
 
 // ── Message Handlers ────────────────────────────────────────────────
 

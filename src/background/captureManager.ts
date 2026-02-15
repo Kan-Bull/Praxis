@@ -12,7 +12,7 @@ import {
   resizeScreenshotSW,
   createThumbnailSW,
 } from './screenshotManager';
-import { saveSession } from './recoveryManager';
+import { saveSession, restoreSession } from './recoveryManager';
 
 // ── State Machine ───────────────────────────────────────────────────
 
@@ -53,6 +53,19 @@ export function setSession(session: CaptureSession | null): void {
     lastStepCreatedAt = 0;
     queuedEvent = null;
   }
+}
+
+/**
+ * Lazy session restore: returns the in-memory session if available,
+ * otherwise rehydrates from chrome.storage.local (survives SW termination).
+ */
+export async function ensureSession(): Promise<CaptureSession | null> {
+  if (currentSession) return currentSession;
+  const restored = await restoreSession();
+  if (restored) {
+    currentSession = restored;
+  }
+  return currentSession;
 }
 
 export function getToolbarPosition(): { x: number; y: number } | null {
