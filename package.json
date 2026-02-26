@@ -1,6 +1,6 @@
 {
   "name": "praxis",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "Capture screenshots and step-by-step workflow guides. Annotate, blur sensitive data, and export as PDF or PNG. Privacy-first, no account needed.",
